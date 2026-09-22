@@ -20,6 +20,12 @@ buffered 读数按既定全局顺序一次性发布（**尾流发布**）、推�
    当所有条件的命中都落在各自的事件时间窗口内时产生**一次** `correlated_entered` 事件；
    任一条件超窗即静默回到等待状态，可再次触发。
 
+此外，`GET /sessions/{id}/release-plan?count=N` 提供**只读释放预演**：在同一 SQLite
+读快照内算出“按全局顺序释放最早 N 条 buffered 读数”所需的最小来源时钟推进方案
+（目标水位线 = 第 N 条 `observed_at` 的下一微秒，各来源所需 effective max =
+目标水位线 + 迟到容忍），逐来源给出 `current` / `required` / `advance_seconds` /
+`blocker`；已封存来源不足时不建议推进，而是返回 `attainable=false` 及原因。
+
 - 语言/框架：Python 3.11 · FastAPI · Uvicorn
 - 存储：SQLite（WAL 模式，单文件，零外部依赖）
 - 并发：写操作在 `BEGIN IMMEDIATE` 事务内串行化，水位线推进单调、发布只发生一次，
@@ -57,7 +63,7 @@ docker compose up --build
 ```bash
 python3 -m pip install -r requirements.txt
 SENSOR_DB_PATH=./sensors.db uvicorn app.main:app --reload --port 8000
-pytest -q        # 运行 148 个端到端行为测试（需 pytest、httpx）
+pytest -q        # 运行 162 个端到端行为测试（需 pytest、httpx）
 ```
 
 ## 时间线语义
@@ -273,7 +279,53 @@ curl -s 'localhost:8000/sessions/lab-1/quarantine'
 }
 ```
 
-### 7. 创建告警规则
+### 7. 释放计划（只读预演）
+
+`GET /sessions/{session_id}/release-plan?count=N`
+
+为 **open** 会话只读计算：要按全局顺序 `(observed_at, source_id, seq)` 释放**最早 N 条
+buffered 读数**，各来源的事件时钟最少需要推进多少。整个计算在**同一个 SQLite 读快照**内
+完成，不写任何数据：
+
+- **目标水位线**：第 N 条 buffered 读数 `observed_at` 的**下一微秒**（发布判定是严格小于、
+  存储精度为微秒，因此这是能放出第 N 条的最小水位线）；只统计 `buffered`，
+  已发布/已隔离读数不参与。
+- **所需 effective max**：目标水位线 + `allowed_lateness_seconds`，对每个来源相同
+  （水位线 = 最慢来源 effective max − 迟到容忍；要让它达到目标，**每个**来源的
+  effective max 都必须到达该值）。
+- 逐来源返回 `current`（当前 effective max：已封存来源取其 `final_observed_at`，否则取
+  已见最大 `observed_at`；**未上报来源为 `null`**）、`required`、`advance_seconds`
+  与 `blocker`：
+  - 已达标来源 `advance_seconds` 为 `0.0`；
+  - 未上报来源 `advance_seconds` 为 `null`、`blocker` 为 `"not_reported"`
+    （首报即需落在 `required` 或其上）；
+  - **已封存来源不足时不建议推进**：`advance_seconds` 为 `null`、`blocker` 为
+    `"sealed_below_required"`，且顶层 `attainable=false`、`reason` 给出原因
+    （封存来源的时钟无法再推进）。
+- `count` 限 1～100（越界或缺失 → 422）；超过当前 buffered 总量 → 422；
+  会话已 `closed` → 409；会话不存在 → 404。
+
+```json
+{
+  "session_id": "lab-1",
+  "count": 2,
+  "buffered": 3,
+  "allowed_lateness_seconds": 10.0,
+  "target_watermark": "2026-09-21T10:00:10.000001Z",
+  "attainable": true,
+  "reason": null,
+  "sources": [
+    {"source_id": "thermometer-a", "current": "2026-09-21T10:00:10Z",
+     "required": "2026-09-21T10:00:20.000001Z", "advance_seconds": 10.000001,
+     "blocker": null},
+    {"source_id": "thermometer-b", "current": null,
+     "required": "2026-09-21T10:00:20.000001Z", "advance_seconds": null,
+     "blocker": "not_reported"}
+  ]
+}
+```
+
+### 8. 创建告警规则
 
 `POST /sessions/{session_id}/alert-rules`
 
@@ -306,12 +358,12 @@ curl -s -X POST localhost:8000/sessions/lab-1/alert-rules \
 响应 201，含规则当前的 `state`（`normal`/`active`）与 `streak`。若该来源此前已有已发布读数，
 创建时立即回放并可能直接返回 `active` 且生成历史事件。
 
-### 8. 查询规则
+### 9. 查询规则
 
 - `GET /sessions/{session_id}/alert-rules`：列出会话全部规则（含当前状态）。
 - `GET /sessions/{session_id}/alert-rules/{rule_id}`：单条规则；不存在 → 404。
 
-### 9. 查询当前告警
+### 10. 查询当前告警
 
 `GET /sessions/{session_id}/alerts/current?source_id=...`
 
@@ -323,7 +375,7 @@ curl -s -X POST localhost:8000/sessions/lab-1/alert-rules \
 curl -s 'localhost:8000/sessions/lab-1/alerts/current'
 ```
 
-### 10. 查询告警历史（分页）
+### 11. 查询告警历史（分页）
 
 `GET /sessions/{session_id}/alerts/history?limit=100&cursor=...&source_id=...&rule_id=...&event_type=...`
 
@@ -336,7 +388,7 @@ curl -s 'localhost:8000/sessions/lab-1/alerts/current'
 curl -s 'localhost:8000/sessions/lab-1/alerts/history?limit=20&event_type=entered'
 ```
 
-### 11. 创建跨来源复合告警规则
+### 12. 创建跨来源复合告警规则
 
 `POST /sessions/{session_id}/correlated-rules`
 
@@ -367,12 +419,12 @@ curl -s -X POST localhost:8000/sessions/lab-1/correlated-rules \
 `last_seq`）。创建时立即回放，已有的已发布读数可能直接让规则返回 `correlated`。
 结构错误（条件数不在 2～4、来源重复、窗口非正、NaN 阈值等）→ 422；重复 `rule_id` → 409。
 
-### 12. 查询复合规则
+### 13. 查询复合规则
 
 - `GET /sessions/{session_id}/correlated-rules`：列出会话全部复合规则（含各条件最近命中）。
 - `GET /sessions/{session_id}/correlated-rules/{rule_id}`：单条规则；不存在 → 404。
 
-### 13. 查询当前复合命中
+### 14. 查询当前复合命中
 
 `GET /sessions/{session_id}/correlated-alerts/current`
 
@@ -384,7 +436,7 @@ curl -s -X POST localhost:8000/sessions/lab-1/correlated-rules \
 curl -s 'localhost:8000/sessions/lab-1/correlated-alerts/current'
 ```
 
-### 14. 查询复合事件历史（分页）
+### 15. 查询复合事件历史（分页）
 
 `GET /sessions/{session_id}/correlated-alerts/history?limit=100&cursor=...&rule_id=...`
 
@@ -396,7 +448,7 @@ curl -s 'localhost:8000/sessions/lab-1/correlated-alerts/current'
 curl -s 'localhost:8000/sessions/lab-1/correlated-alerts/history?limit=20'
 ```
 
-### 15. 创建消费者检查点
+### 16. 创建消费者检查点
 
 `POST /sessions/{session_id}/checkpoints`
 
@@ -426,7 +478,7 @@ curl -s -X POST localhost:8000/sessions/lab-1/checkpoints \
 会话不存在 → 404；名称非法（空、含空格/斜杠等）或缺字段 → 422。
 检查点行一旦写入即为**不可变快照**：后续发布、来源封存乃至会话关闭都不会修改它。
 
-### 16. 列出 / 删除检查点
+### 17. 列出 / 删除检查点
 
 - `GET /sessions/{session_id}/checkpoints`：列出会话全部检查点（按创建时间、名称排序），
   每项含完整位置与水位线快照；会话不存在 → 404。
@@ -438,7 +490,7 @@ curl -s localhost:8000/sessions/lab-1/checkpoints
 curl -s -X DELETE localhost:8000/sessions/lab-1/checkpoints/consumer-1
 ```
 
-### 17. 从检查点继续读取
+### 18. 从检查点继续读取
 
 `GET /sessions/{session_id}/checkpoints/{name}/stream?limit=100&cursor=...`
 
@@ -533,7 +585,8 @@ curl -s 'localhost:8000/sessions/lab-1/checkpoints/consumer-1/stream?limit=50'
 │   ├── alerts.py        # 单来源告警状态机、规则创建（回放）、当前/历史查询
 │   ├── correlated.py    # 跨来源复合规则、窗口命中维护、回放、当前/历史查询
 │   ├── checkpoints.py   # 发布流消费者检查点：创建（同快照位置+水位线）/列表/删除/继续读取
-│   ├── errors.py        # 400/404/409 业务异常
+│   ├── release_plan.py  # 只读释放预演：同一读快照内计算最小来源时钟推进方案
+│   ├── errors.py        # 400/404/409/422 业务异常
 │   ├── cursor.py        # 不透明 keyset 分页游标
 │   ├── database.py      # SQLite schema、版本化迁移、连接、BEGIN IMMEDIATE 事务
 │   ├── models.py        # Pydantic 请求/响应模型
@@ -544,6 +597,7 @@ curl -s 'localhost:8000/sessions/lab-1/checkpoints/consumer-1/stream?limit=50'
 │   ├── test_alerts.py       # 单来源告警状态机/滞回/连续次数/隔离/回放/分页测试（27 个）
 │   ├── test_correlated.py   # 跨来源复合/窗口/过期/再触发/隔离/回放/迁移测试（35 个）
 │   ├── test_sealing.py      # 来源封存/幂等冲突/尾流发布/关闭/封存-上报并发测试（25 个）
+│   ├── test_release_plan.py # 释放计划/目标水位线/封存不足/422/409/只读性测试（14 个）
 │   └── test_checkpoints.py  # 检查点创建/幂等/409/继续读取分页/不可变/迁移测试（39 个）
 ├── Dockerfile
 ├── docker-compose.yml

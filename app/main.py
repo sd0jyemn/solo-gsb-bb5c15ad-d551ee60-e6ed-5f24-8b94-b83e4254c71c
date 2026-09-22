@@ -8,7 +8,7 @@ from typing import Any, Optional
 from fastapi import Depends, FastAPI, Query, Request, Response
 from fastapi.responses import JSONResponse
 
-from . import alerts, checkpoints, correlated, service
+from . import alerts, checkpoints, correlated, release_plan, service
 from .config import settings
 from .database import get_db, init_db
 from .models import (
@@ -31,6 +31,7 @@ from .models import (
     PullResponse,
     QuarantineResponse,
     ReadingIn,
+    ReleasePlanResponse,
     ReportResponse,
     SealSourceIn,
     SessionOut,
@@ -109,6 +110,37 @@ def get_session(
     conn: sqlite3.Connection = Depends(get_db),
 ) -> SessionOut:
     return SessionOut(**service.get_session(conn, session_id))
+
+
+@app.get(
+    "/sessions/{session_id}/release-plan",
+    response_model=ReleasePlanResponse,
+    tags=["sessions"],
+)
+def get_release_plan(
+    session_id: str,
+    count: int = Query(
+        ..., ge=1, le=100,
+        description="Release the earliest N buffered readings (1-100)",
+    ),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> ReleasePlanResponse:
+    """Read-only minimal clock-advancement plan for an open session.
+
+    Computes, inside one SQLite read snapshot, the smallest per-source
+    effective-max advancement that would release the earliest ``count``
+    buffered readings in the deterministic global order: the target
+    watermark is one microsecond past the Nth buffered reading's
+    ``observed_at``, and each source's required effective max is that target
+    plus ``allowed_lateness_seconds``.  Unreported sources have
+    ``current = null``; a sealed source below its required max makes the
+    plan ``attainable = false`` instead of suggesting an impossible
+    advancement.  Closed sessions return 409; a ``count`` beyond the
+    buffered backlog returns 422.
+    """
+    return ReleasePlanResponse(
+        **release_plan.compute_release_plan(conn, session_id, count)
+    )
 
 
 @app.post("/sessions/{session_id}/sources/{source_id}/seal",

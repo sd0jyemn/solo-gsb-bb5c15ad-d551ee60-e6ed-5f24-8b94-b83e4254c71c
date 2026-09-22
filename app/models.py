@@ -136,6 +136,63 @@ class CreatedSessionResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# release planning over the buffered backlog
+# ---------------------------------------------------------------------------
+
+class ReleasePlanSourceOut(BaseModel):
+    source_id: str
+    current: Optional[str] = Field(
+        None,
+        description=(
+            "The source's current effective clock (sealed final time, else"
+            " largest reported observed_at); null until the first report"
+        ),
+    )
+    required: str = Field(
+        ...,
+        description=(
+            "Effective max this source must reach: target_watermark +"
+            " allowed_lateness_seconds"
+        ),
+    )
+    advance_seconds: Optional[float] = Field(
+        None,
+        description=(
+            "How far the source clock must advance (0 when already"
+            " sufficient); null when no advancement can be suggested"
+            " (unreported or sealed below required)"
+        ),
+    )
+    blocker: Optional[str] = Field(
+        None,
+        description="null, 'not_reported' or 'sealed_below_required'",
+    )
+
+
+class ReleasePlanResponse(BaseModel):
+    session_id: str
+    count: int
+    buffered: int
+    allowed_lateness_seconds: float
+    target_watermark: str = Field(
+        ...,
+        description=(
+            "One microsecond past the Nth buffered reading's observed_at:"
+            " the smallest watermark that releases it"
+        ),
+    )
+    attainable: bool = Field(
+        ...,
+        description=(
+            "False when a sealed source's final time is below the required"
+            " effective max (sealed sources cannot be advanced)"
+        ),
+    )
+    reason: Optional[str] = None
+    sources: list[ReleasePlanSourceOut]
+
+
+# ---------------------------------------------------------------------------
 # alert rules
 # ---------------------------------------------------------------------------
 
