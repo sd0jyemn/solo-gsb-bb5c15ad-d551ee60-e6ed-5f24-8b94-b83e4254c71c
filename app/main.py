@@ -8,7 +8,7 @@ from typing import Any, Optional
 from fastapi import Depends, FastAPI, Query, Request, Response
 from fastapi.responses import JSONResponse
 
-from . import alerts, checkpoints, correlated, service
+from . import alerts, checkpoints, correlated, release_plan, service
 from .config import settings
 from .database import get_db, init_db
 from .models import (
@@ -31,6 +31,7 @@ from .models import (
     PullResponse,
     QuarantineResponse,
     ReadingIn,
+    ReleasePlanResponse,
     ReportResponse,
     SealSourceIn,
     SessionOut,
@@ -47,7 +48,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Lab Sensor Timeline Merge API",
-    version="1.4.0",
+    version="1.5.0",
     description=(
         "Out-of-order sensor reporting with per-session fixed source lists, "
         "a slowest-source watermark (minus allowed lateness), deterministic "
@@ -58,7 +59,10 @@ app = FastAPI(
         "drive per-source threshold alert state machines (enter / active / "
         "recovered) with hysteresis and consecutive-count debouncing, plus "
         "cross-source correlated rules that fire once when 2-4 sources breach "
-        "their own thresholds together inside a shared event-time window."
+        "their own thresholds together inside a shared event-time window. A "
+        "read-only release-plan endpoint computes, in one snapshot, the "
+        "minimal per-source clock advancement needed to release the earliest "
+        "N buffered readings."
     ),
     lifespan=lifespan,
 )
@@ -213,6 +217,37 @@ def pull_quarantine(
 ) -> QuarantineResponse:
     """Late readings that arrived behind the already-published watermark."""
     return QuarantineResponse(**service.list_quarantined(conn, session_id, limit, cursor))
+
+
+@app.get(
+    "/sessions/{session_id}/release-plan",
+    response_model=ReleasePlanResponse,
+    tags=["readings"],
+)
+def get_release_plan(
+    session_id: str,
+    count: int = Query(
+        ...,
+        ge=1,
+        le=100,
+        description="Release the earliest `count` buffered readings (1-100)",
+    ),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> ReleasePlanResponse:
+    """Minimal per-source clock advancement that would release the earliest
+    ``count`` buffered readings of an open session.
+
+    Read-only: the buffered prefix, the per-source clocks and the allowed
+    lateness are all read inside one SQLite snapshot.  The target watermark
+    is one microsecond beyond the Nth buffered reading's ``observed_at``;
+    every source's required effective max is that target plus the allowed
+    lateness.  Sealed sources that fall short make the plan unattainable
+    instead of being suggested to advance.  ``count`` larger than the
+    buffered backlog returns 422; a closed session returns 409.
+    """
+    return ReleasePlanResponse(
+        **release_plan.compute_release_plan(conn, session_id, count)
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -16,3 +16,7 @@ class BadRequestError(ServiceError):
 
 class ConflictError(ServiceError):
     status_code = 409
+
+
+class UnprocessableEntityError(ServiceError):
+    status_code = 422

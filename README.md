@@ -20,6 +20,10 @@ buffered 读数按既定全局顺序一次性发布（**尾流发布**）、推�
    当所有条件的命中都落在各自的事件时间窗口内时产生**一次** `correlated_entered` 事件；
    任一条件超窗即静默回到等待状态，可再次触发。
 
+此外，**释放计划**接口为 open 会话只读回答“要按全局顺序放出最早 N 条 buffered 读数，
+各来源的事件时钟最少需要推进到哪儿”：整个计算在同一个 SQLite 读快照内完成，
+已封存而时钟不足的来源不会被建议推进，而是直接给出 `attainable=false` 及原因。
+
 - 语言/框架：Python 3.11 · FastAPI · Uvicorn
 - 存储：SQLite（WAL 模式，单文件，零外部依赖）
 - 并发：写操作在 `BEGIN IMMEDIATE` 事务内串行化，水位线推进单调、发布只发生一次，
@@ -57,7 +61,7 @@ docker compose up --build
 ```bash
 python3 -m pip install -r requirements.txt
 SENSOR_DB_PATH=./sensors.db uvicorn app.main:app --reload --port 8000
-pytest -q        # 运行 148 个端到端行为测试（需 pytest、httpx）
+pytest -q        # 运行 167 个端到端行为测试（需 pytest、httpx）
 ```
 
 ## 时间线语义
@@ -457,6 +461,53 @@ curl -s 'localhost:8000/sessions/lab-1/checkpoints/consumer-1/stream?limit=50'
 
 检查点不存在 → 404，会话不存在 → 404。
 
+### 18. 计算释放计划（只读）
+
+`GET /sessions/{session_id}/release-plan?count=N`
+
+为 **open** 会话只读计算：要按全局顺序 `(observed_at, source_id, seq)` 释放最早 N 条
+buffered 读数，各来源的事件时钟最少需要推进到哪里。整个计算在**同一个 SQLite 读快照**
+内完成（缓冲前缀、各来源时钟与迟到容忍来自同一一致视图），不写任何数据：
+
+- **目标水位线** = 第 N 条 buffered 读数 `observed_at` 的**下一微秒**（发布规则是严格
+  小于、存储精度为微秒，这是能放出该读数的最小水位线）；已发布/已隔离读数不参与。
+- 各来源所需 effective max `required` = 目标水位线 + `allowed_lateness_seconds`
+  （水位线 = 最慢来源时钟 − 迟到容忍，因此每个来源的时钟都必须到达这里）。
+- 逐来源返回（按会话声明顺序）：`current`（当前有效时钟，封存来源为其
+  `final_observed_at`；从未上报的来源为 `null`）、`required`、`advance_seconds`
+  （还需推进的秒数，已达标为 0）与 `blocker`。
+- `blocker` 取值：`null` 已达标；`below_required` 时钟不足、按 `advance_seconds`
+  推进即可；`not_reported` 尚未首报（`current`/`advance_seconds` 均为 `null`）。
+- **已封存来源时钟不足时不得建议推进**：其 `advance_seconds` 为 `null`、`blocker`
+  为 `sealed_below_required`，且顶层 `attainable=false`、`reason` 说明原因
+  （封存时钟已不可再推进，靠推进时钟无法释放这些读数）。
+- `count` 限 1～100；超过当前 buffered 条数 → 422；会话已 `closed` → 409
+  （关闭时尾流发布已清空缓冲区）；会话不存在 → 404。
+
+```bash
+curl -s 'localhost:8000/sessions/lab-1/release-plan?count=2'
+```
+
+```json
+{
+  "session_id": "lab-1",
+  "count": 2,
+  "buffered": 4,
+  "allowed_lateness_seconds": 10.0,
+  "target_watermark": "2026-09-21T10:00:30.000001Z",
+  "attainable": true,
+  "reason": null,
+  "sources": [
+    {"source_id": "thermometer-a", "current": "2026-09-21T10:00:40Z",
+     "required": "2026-09-21T10:00:40.000001Z", "advance_seconds": 0.000001,
+     "blocker": "below_required"},
+    {"source_id": "thermometer-b", "current": "2026-09-21T10:01:00Z",
+     "required": "2026-09-21T10:00:40.000001Z", "advance_seconds": 0.0,
+     "blocker": null}
+  ]
+}
+```
+
 ## 数据库迁移
 
 建表采用“**幂等基础 schema + 版本化迁移**”：应用启动（FastAPI lifespan）时自动创建
@@ -533,7 +584,8 @@ curl -s 'localhost:8000/sessions/lab-1/checkpoints/consumer-1/stream?limit=50'
 │   ├── alerts.py        # 单来源告警状态机、规则创建（回放）、当前/历史查询
 │   ├── correlated.py    # 跨来源复合规则、窗口命中维护、回放、当前/历史查询
 │   ├── checkpoints.py   # 发布流消费者检查点：创建（同快照位置+水位线）/列表/删除/继续读取
-│   ├── errors.py        # 400/404/409 业务异常
+│   ├── release_plan.py  # 释放计划：同一读快照内计算放出最早 N 条 buffered 读数的最小时钟推进
+│   ├── errors.py        # 400/404/409/422 业务异常
 │   ├── cursor.py        # 不透明 keyset 分页游标
 │   ├── database.py      # SQLite schema、版本化迁移、连接、BEGIN IMMEDIATE 事务
 │   ├── models.py        # Pydantic 请求/响应模型
@@ -544,7 +596,8 @@ curl -s 'localhost:8000/sessions/lab-1/checkpoints/consumer-1/stream?limit=50'
 │   ├── test_alerts.py       # 单来源告警状态机/滞回/连续次数/隔离/回放/分页测试（27 个）
 │   ├── test_correlated.py   # 跨来源复合/窗口/过期/再触发/隔离/回放/迁移测试（35 个）
 │   ├── test_sealing.py      # 来源封存/幂等冲突/尾流发布/关闭/封存-上报并发测试（25 个）
-│   └── test_checkpoints.py  # 检查点创建/幂等/409/继续读取分页/不可变/迁移测试（39 个）
+│   ├── test_checkpoints.py  # 检查点创建/幂等/409/继续读取分页/不可变/迁移测试（39 个）
+│   └── test_release_plan.py # 释放计划目标水位线/逐来源推进/封存不可达/422/409/并发只读测试（19 个）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

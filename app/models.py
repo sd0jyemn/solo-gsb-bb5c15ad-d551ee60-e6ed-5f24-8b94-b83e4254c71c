@@ -478,3 +478,67 @@ class CheckpointStreamResponse(BaseModel):
         None, description="The session's current published watermark (may advance later)"
     )
     readings: list[ReadingOut]
+
+
+# ---------------------------------------------------------------------------
+# release planning over buffered readings
+# ---------------------------------------------------------------------------
+
+class ReleasePlanSourceOut(BaseModel):
+    source_id: str
+    current: Optional[str] = Field(
+        None,
+        description=(
+            "The source's current effective clock (its final_observed_at when"
+            " sealed); null while the source has never reported"
+        ),
+    )
+    required: str = Field(
+        ...,
+        description=(
+            "Effective max this source's clock must reach: target watermark"
+            " plus the session's allowed lateness"
+        ),
+    )
+    advance_seconds: Optional[float] = Field(
+        None,
+        description=(
+            "How many seconds the source clock must still advance (0 when"
+            " already sufficient); null when not computable (never reported)"
+            " or not allowed (sealed below required)"
+        ),
+    )
+    blocker: Optional[
+        Literal["below_required", "not_reported", "sealed_below_required"]
+    ] = Field(
+        None,
+        description=(
+            "Why this source is holding the release back; null when its clock"
+            " already satisfies the requirement"
+        ),
+    )
+
+
+class ReleasePlanResponse(BaseModel):
+    session_id: str
+    count: int = Field(..., description="Number of earliest buffered readings planned for")
+    buffered: int = Field(..., description="Total buffered readings in the same snapshot")
+    allowed_lateness_seconds: float
+    target_watermark: str = Field(
+        ...,
+        description=(
+            "One microsecond beyond the Nth buffered reading's observed_at:"
+            " the smallest watermark that releases it"
+        ),
+    )
+    attainable: bool = Field(
+        ...,
+        description=(
+            "False when a sealed source's final clock falls short of required,"
+            " so no clock-advancement plan can release the readings"
+        ),
+    )
+    reason: Optional[str] = Field(
+        None, description="Why the plan is unattainable; null when attainable"
+    )
+    sources: list[ReleasePlanSourceOut]
